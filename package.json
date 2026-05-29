@@ -1,12 +1,21 @@
 {
-  "name": "dodeys-supercleaner",
-  "version": "1.0.0",
-  "description": "Utility to find and clean dead TypeScript, Svelte, and CSS code in Dodeys workspaces",
+  "name": "supercleaner",
+  "version": "1.1.0",
+  "description": "Scan and clean dead TypeScript, Svelte, and CSS code in Bun projects",
   "type": "module",
   "main": "index.ts",
   "scripts": {
-    "clean": "bun run index.ts"
+    "start": "bun run index.ts",
+    "scan": "bun run index.ts"
   },
+  "keywords": [
+    "dead-code",
+    "svelte",
+    "typescript",
+    "cleanup",
+    "static-analysis"
+  ],
+  "license": "MIT",
   "devDependencies": {
     "typescript": "^5.9.3"
   }

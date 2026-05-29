@@ -1,8 +1,15 @@
 import { existsSync, readFileSync, statSync, unlinkSync, readSync } from "fs";
-import { resolve, relative, basename } from "path";
-import { scanFiles, analyzeFile, detectDeadFiles, detectDeadExports } from "./parser.ts";
+import { resolve, relative, basename, dirname } from "path";
+import {
+  scanFiles,
+  analyzeFile,
+  detectDeadFiles,
+  detectDeadExports,
+  collectAuxiliaryReferenceFiles,
+} from "./parser.ts";
 import type { FileAnalysis } from "./parser.ts";
 import { createBackup, applyFileCleaning } from "./cleaner.ts";
+import { findProjectRoot, isProtectedFile } from "./project.ts";
 
 // ANSI Terminal Colors
 const c = {
@@ -61,12 +68,15 @@ async function main() {
   let dryRun = true;
   let cleanTypes: string[] = ["all"];
   let backupEnabled = true;
+  let assumeYes = false;
 
   // Manual argument parsing
   for (let i = 2; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--clean") {
       dryRun = false;
+    } else if (arg === "--yes" || arg === "-y") {
+      assumeYes = true;
     } else if (arg === "--path" && args[i + 1]) {
       targetPath = resolve(process.cwd(), args[i + 1]);
       i++;
@@ -92,7 +102,15 @@ async function main() {
   const stat = statSync(targetPath);
   let isSingleFile = !stat.isDirectory();
   let filesToScan: string[] = [];
-  let rootFolder = isSingleFile ? resolve(targetPath, "..") : targetPath;
+  const projectRoot = findProjectRoot(targetPath);
+  const scanRoot = isSingleFile ? dirname(targetPath) : targetPath;
+  const rootFolder = projectRoot;
+
+  if (projectRoot !== resolve(scanRoot)) {
+    console.log(
+      `${c.dim}Project root detected at ${relative(process.cwd(), projectRoot)} (path aliases resolved from here).${c.reset}`
+    );
+  }
 
   if (isSingleFile) {
     filesToScan = [targetPath];
@@ -149,10 +167,17 @@ async function main() {
 
   if (!isSingleFile) {
     console.log(`${c.blue}Resolving import graph and public exports...${c.reset}`);
-    const deadFilesResult = detectDeadFiles(filesToScan, rootFolder);
+    const auxiliaryFiles = collectAuxiliaryReferenceFiles(projectRoot, scanRoot);
+    if (auxiliaryFiles.length > 0) {
+      console.log(
+        `${c.dim}Including ${auxiliaryFiles.length} auxiliary file(s) (tests, full src) for export/import cross-check.${c.reset}`
+      );
+    }
+
+    const deadFilesResult = detectDeadFiles(filesToScan, projectRoot);
     deadFiles = deadFilesResult.deadFiles;
 
-    deadExports = detectDeadExports(filesToScan, rootFolder, analyses);
+    deadExports = detectDeadExports(filesToScan, projectRoot, analyses, auxiliaryFiles);
   }
 
   console.log(`\n${c.bold}${c.cyan}SCAN SUMMARY (DRY RUN)${c.reset}`);
@@ -239,7 +264,17 @@ async function main() {
   }
 
   // --- Step 4: Clean Phase (Interactive) ---
-  const hasAnythingToClean = totalUnusedImports > 0 || totalUnusedVars > 0 || totalUnusedCSS > 0 || deadFiles.length > 0;
+  const cleanAll = cleanTypes.includes("all");
+  const cleanImports = cleanAll || cleanTypes.includes("imports");
+  const cleanVariables = cleanAll || cleanTypes.includes("variables");
+  const cleanCSS = cleanAll || cleanTypes.includes("css");
+  const cleanFiles = cleanAll || cleanTypes.includes("files");
+
+  const hasAnythingToClean =
+    (cleanImports && totalUnusedImports > 0) ||
+    (cleanVariables && totalUnusedVars > 0) ||
+    (cleanCSS && totalUnusedCSS > 0) ||
+    (cleanFiles && deadFiles.length > 0);
 
   if (!hasAnythingToClean) {
     console.log(`${c.green}No dead TypeScript, Svelte, or CSS code detected in this path.${c.reset}\n`);
@@ -251,7 +286,9 @@ async function main() {
   // Interactive Prompt if running in dry-run mode
   if (dryRun) {
     console.log(`${c.yellow}This analysis was performed in report-only mode (Dry Run). No files were modified.${c.reset}`);
-    const answer = readlinePrompt(`Do you want to apply automatic cleaning to these files now? (${c.bold}y/n${c.reset}): `);
+    const answer = assumeYes
+      ? "y"
+      : readlinePrompt(`Do you want to apply automatic cleaning to these files now? (${c.bold}y/n${c.reset}): `);
     if (answer?.toLowerCase() === "y" || answer?.toLowerCase() === "yes" || answer?.toLowerCase() === "s" || answer?.toLowerCase() === "si") {
       performClean = true;
     }
@@ -265,12 +302,8 @@ async function main() {
       console.log(`${c.blue}Creating backups in .supercleaner-backup/...${c.reset}`);
       let backupCount = 0;
       for (const analysis of analyses) {
-        const unusedImps = analysis.imports.filter((i) => i.unusedBindings.length > 0);
-        const unusedLocals = analysis.localDeclarations.filter((d) => d.unused && !d.isExported);
-        const unusedCSS = analysis.unusedCSSSelectors;
-
-        if (unusedImps.length > 0 || unusedLocals.length > 0 || unusedCSS.length > 0) {
-          createBackup(analysis.filePath, rootFolder);
+        if (fileNeedsCleaning(analysis, cleanTypes)) {
+          createBackup(analysis.filePath, projectRoot);
           backupCount++;
         }
       }
@@ -282,31 +315,31 @@ async function main() {
     // 2. Apply cleaning on files
     let cleanedFilesCount = 0;
     for (const analysis of analyses) {
-      const unusedImps = analysis.imports.filter((i) => i.unusedBindings.length > 0);
-      const unusedLocals = analysis.localDeclarations.filter((d) => d.unused && !d.isExported);
-      const unusedCSS = analysis.unusedCSSSelectors;
+      if (!fileNeedsCleaning(analysis, cleanTypes)) {
+        continue;
+      }
 
-      if (unusedImps.length > 0 || unusedLocals.length > 0 || unusedCSS.length > 0) {
-        try {
-          const content = readFileSync(analysis.filePath, "utf-8");
-          applyFileCleaning(analysis.filePath, content, analysis, cleanTypes);
-          cleanedFilesCount++;
-          console.log(`  Cleaned: ${c.bold}${relative(rootFolder, analysis.filePath)}${c.reset}`);
-        } catch (e) {
-          console.log(`  Error cleaning ${basename(analysis.filePath)}: ${e}`);
-        }
+      try {
+        const content = readFileSync(analysis.filePath, "utf-8");
+        applyFileCleaning(analysis.filePath, content, analysis, cleanTypes);
+        cleanedFilesCount++;
+        console.log(`  Cleaned: ${c.bold}${relative(rootFolder, analysis.filePath)}${c.reset}`);
+      } catch (e) {
+        console.log(`  Error cleaning ${basename(analysis.filePath)}: ${e}`);
       }
     }
 
     // 3. Handle dead files deletion/archive (interactive confirmation)
-    if (deadFiles.length > 0 && !isSingleFile) {
+    if (cleanFiles && deadFiles.length > 0 && !isSingleFile) {
       console.log(`\n${c.yellow}Found ${deadFiles.length} orphan files.${c.reset}`);
-      const fileAction = readlinePrompt(`Do you want to physically delete these orphan files from disk? (${c.bold}y/n${c.reset}): `);
+      const fileAction = assumeYes
+        ? "n"
+        : readlinePrompt(`Do you want to physically delete these orphan files from disk? (${c.bold}y/n${c.reset}): `);
       if (fileAction?.toLowerCase() === "y" || fileAction?.toLowerCase() === "yes" || fileAction?.toLowerCase() === "s" || fileAction?.toLowerCase() === "si") {
         for (const file of deadFiles) {
           try {
             if (backupEnabled) {
-              createBackup(file, rootFolder);
+              createBackup(file, projectRoot);
             }
             unlinkSync(file);
             console.log(`  Deleted: ${c.bold}${relative(rootFolder, file)}${c.reset}`);
@@ -327,6 +360,27 @@ async function main() {
   } else {
     console.log(`\n${c.yellow}Operation cancelled. No files were modified.${c.reset}\n`);
   }
+}
+
+function fileNeedsCleaning(analysis: FileAnalysis, types: string[]): boolean {
+  if (isProtectedFile(analysis.filePath)) {
+    return false;
+  }
+
+  const cleanAll = types.includes("all");
+  const cleanImports = cleanAll || types.includes("imports");
+  const cleanVariables = cleanAll || types.includes("variables");
+  const cleanCSS = cleanAll || types.includes("css");
+
+  const unusedImps = analysis.imports.filter((i) => i.unusedBindings.length > 0);
+  const unusedLocals = analysis.localDeclarations.filter((d) => d.unused && !d.isExported);
+  const unusedCSS = analysis.unusedCSSSelectors;
+
+  return (
+    (cleanImports && unusedImps.length > 0) ||
+    (cleanVariables && unusedLocals.length > 0) ||
+    (cleanCSS && unusedCSS.length > 0)
+  );
 }
 
 main().catch((err) => {

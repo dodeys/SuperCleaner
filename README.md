@@ -1,67 +1,67 @@
 # SuperCleaner
 
-A powerful, experimental Bun-native utility designed to scan, report, and automatically clean dead code (TypeScript, Svelte, and obsolete CSS) inside Dodeys workspace folders.
+Experimental Bun utility to scan, report, and optionally remove dead code in TypeScript, JavaScript, and Svelte projects.
 
-Since a significant portion of project code is AI-generated, it tends to leave behind unused local declarations, orphan imports, and obsolete stylesheet selectors. `supercleaner` helps maintain a clean, optimal codebase before deployments.
+It targets common leftovers from generated code: unused imports, unused locals, obsolete Svelte CSS selectors, unreachable modules, and exported symbols that nothing imports.
 
-## Core Features
+## Features
 
-1. **Orphan Files (Dead Files)**: Detects `.ts`, `.js`, and `.svelte` files with zero incoming imports from other files. Automatically excludes SvelteKit routing conventions (`+page.svelte`, `+server.ts`, etc.), test suites, and core configuration assets.
-2. **Dead Exports**: Identifies functions, constants, or classes with `export` modifiers that are never imported anywhere else in the project.
-3. **Orphan Imports (Unused Imports)**: Scans and safely removes unused imports in `.ts` and `.svelte` scripts.
-4. **Unused Local Declarations**: Detects unused local variables, functions, types, interfaces, or enums declared inside a file.
-5. **Unused Svelte CSS (Obsolete Selectors)**: Analyzes `<style>` tags in Svelte components, identifying and removing classes or IDs that are not referenced in the HTML template.
+1. **Orphan files** — modules with no incoming imports inside the scanned tree.
+2. **Dead exports** — named exports never imported from another file (resolved by module path, not text search).
+3. **Unused imports** — removes unused named/default bindings from import statements.
+4. **Unused locals** — flags unused non-exported declarations (with conservative safety rules).
+5. **Unused Svelte CSS** — selectors in `<style>` blocks not referenced by the component template.
 
----
+## Safety model
 
-## Operating Modes and Safety Measures
+- **Dry run by default** — reports only unless `--clean` is passed.
+- **Backups** — writes copies to `.supercleaner-backup/` before edits (disable with `--no-backup`).
+- **Protected files** — SvelteKit routes (`+page.svelte`, etc.), `app.d.ts`, hooks, declaration files, and shared `lib/` modules are not treated as orphan files.
+- **Entry points** — worker/app entry files and test files are excluded from orphan/dead-export heuristics.
+- **Path aliases** — resolves `$lib`, `@/`, `~/`, `src/`, and `tsconfig` paths from the detected project root.
+- **Cross-folder context** — when scanning `src/`, test files and the full `src` tree are included for import/export analysis.
 
-* **Dry Run (Default)**: Scans the target workspace and prints a detailed report in the console without modifying any files.
-* **Automatic Backup**: When executing active cleaning (`--clean`), SuperCleaner creates an exact copy of modified files inside `.supercleaner-backup/` before rewriting them. This allows an immediate rollback if needed.
-* **Interactive Prompts**: Solicits confirmation at each cleaning stage.
-
----
-
-## Getting Started
-
-First, navigate to the utility folder and install the development dependencies (primarily the native TypeScript compiler API used for AST analysis):
+## Install
 
 ```bash
 cd experimental/supercleaner
-/Users/imac/.bun/bin/bun install
+bun install
 ```
 
-### Usage Examples
+## Usage
 
-#### 1. Scan a Specific Worker (Report / Dry Run Mode)
 ```bash
-/Users/imac/.bun/bin/bun run index.ts --path ../../dodeys-api-worker
+# Report only (recommended first)
+bun run index.ts --path /path/to/your-project
+
+# Scan a subdirectory (project root is auto-detected upward)
+bun run index.ts --path /path/to/your-project/src
+
+# Apply safe cleanups (imports, variables, css)
+bun run index.ts --path /path/to/your-project --clean --type imports,variables,css
+
+# Non-interactive clean (skips prompts; never auto-deletes orphan files)
+bun run index.ts --path /path/to/your-project --clean --yes
 ```
 
-#### 2. Scan and Clean Specific Categories (Imports and CSS Selectors)
-```bash
-/Users/imac/.bun/bin/bun run index.ts --path ../../dodeys-dash-worker --clean --type imports,css
-```
+## CLI flags
 
-#### 3. Scan the Entire Dodeys Project Directory
-```bash
-/Users/imac/.bun/bin/bun run index.ts --path ../../
-```
+| Flag | Description |
+|------|-------------|
+| `--path <dir\|file>` | Target to analyze (default: current directory). |
+| `--clean` | Apply changes on disk. |
+| `--type <list>` | `imports`, `variables`, `css`, `files`, or `all` (default). |
+| `--no-backup` | Skip `.supercleaner-backup/` copies. |
+| `--yes` / `-y` | Auto-confirm clean prompt; orphan file deletion stays off unless you confirm manually. |
 
----
+## Framework notes
 
-## CLI Flags
+- **Svelte**: imports used only in templates are kept. Tag selectors without classes/IDs are not removed automatically.
+- **SvelteKit**: `+` route files are always treated as entrypoints.
+- **Tests**: files under `test/`, `tests/`, and `__tests__/` are included when resolving dead exports, even if you only scan `src/`.
 
-| Flag | Type | Description |
-| :--- | :--- | :--- |
-| `--path` | `string` | The directory or file to analyze (defaults to current working directory). |
-| `--clean` | `boolean` | Executes real, on-disk file cleaning. If omitted, runs in report-only (dry run) mode. |
-| `--type` | `string` | Comma-separated list of clean targets: `imports`, `variables`, `css`, `files`, or `all` (default). |
-| `--no-backup` | `boolean` | Disables automated file backups. Backups are enabled by default. |
+## Limitations
 
----
-
-## Svelte Framework Guardrails
-
-* **Template-Aware Refcounting**: A component imported in Svelte scripts (e.g., `import Button from "./Button.svelte"`) that is only referenced in Svelte's HTML template (`<Button />`) will **not** be flagged as unused. SuperCleaner scans the entire file content before marking any import as orphan.
-* **Route Ignorance**: SvelteKit routes prefixed with `+` are considered public API entrypoints and are strictly protected from dead file classification.
+- Dynamic imports with non-literal specifiers are not tracked.
+- Framework virtual modules (`$app/*`, etc.) are ignored for file resolution.
+- Orphan file deletion is opt-in and always requires explicit confirmation (unless you answer the prompt).

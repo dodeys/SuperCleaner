@@ -1,6 +1,13 @@
 import ts from "typescript";
-import { join, dirname, resolve, extname } from "path";
-import { existsSync, readFileSync, readdirSync, statSync } from "fs";
+import { join, dirname, resolve, relative } from "path";
+import { existsSync, readFileSync, readdirSync } from "fs";
+import {
+  buildDefaultAliases,
+  isEntryPointFile,
+  isExternalModule,
+  isProtectedFile,
+  resolveImportPath,
+} from "./project.ts";
 
 export interface ImportBinding {
   name: string;
@@ -212,6 +219,7 @@ export function extractCSSSelectors(css: string): CSSSelectorInfo[] {
  * Core function to parse and analyze a TS, JS, or Svelte file.
  */
 export function analyzeFile(filePath: string, fileContent: string): FileAnalysis {
+  const isDeclarationFile = filePath.endsWith(".d.ts");
   const isSvelte = filePath.endsWith(".svelte");
   let scriptContent = fileContent;
   let svelteStyle: SvelteParts["style"] = null;
@@ -360,6 +368,12 @@ export function analyzeFile(filePath: string, fileContent: string): FileAnalysis
   }
 
   for (const decl of localDeclarations) {
+    if (isDeclarationFile) {
+      // Ambient types (e.g. App.Platform in app.d.ts) are consumed by the framework, not local code.
+      decl.unused = false;
+      continue;
+    }
+
     if (!decl.isExported) {
       const refs = references.get(decl.name) || [];
       // Exclude references that fall inside its own definition coordinates
@@ -423,8 +437,9 @@ export function scanFiles(dirPath: string, rootPath: string = dirPath): string[]
     ".git",
     ".wrangler",
     ".svelte-kit",
+    ".supercleaner-backup",
     "dist",
-    "build"
+    "build",
   ];
 
   // Exclude patterns for specific system files
@@ -470,57 +485,107 @@ export function scanFiles(dirPath: string, rootPath: string = dirPath): string[]
   return fileList;
 }
 
+export interface ImportedSymbol {
+  name: string;
+  sourceFile: string;
+  fromPath: string;
+}
+
 /**
- * Resolves an import source path to its actual file path.
+ * Extracts static import specifiers and named bindings from source text.
  */
-export function resolveImportPath(
+export function extractImportsFromSource(
+  scriptContent: string,
   importingFile: string,
-  importSource: string,
-  allProjectFiles: string[],
-  projectRoot: string
-): string | null {
-  // If it's a module from node_modules, ignore
-  if (!importSource.startsWith(".") && !importSource.startsWith("$lib/") && !importSource.startsWith("src/")) {
-    return null;
+  projectFiles: string[],
+  projectRoot: string,
+  aliases: Map<string, string>
+): { resolvedTargets: string[]; importedSymbols: ImportedSymbol[] } {
+  const resolvedTargets: string[] = [];
+  const importedSymbols: ImportedSymbol[] = [];
+
+  const staticImportRegex = /import\s+(?:type\s+)?(?:[\w*{}\s,]+)\s+from\s+['"]([^'"]+)['"]/gi;
+  const sideEffectImportRegex = /import\s+['"]([^'"]+)['"]/gi;
+  const dynamicImportRegex = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/gi;
+
+  const specifiers = new Set<string>();
+
+  let match: RegExpExecArray | null;
+  while ((match = staticImportRegex.exec(scriptContent)) !== null) {
+    specifiers.add(match[1]);
+  }
+  while ((match = sideEffectImportRegex.exec(scriptContent)) !== null) {
+    specifiers.add(match[1]);
+  }
+  while ((match = dynamicImportRegex.exec(scriptContent)) !== null) {
+    specifiers.add(match[1]);
   }
 
-  let targetPath = "";
-  if (importSource.startsWith("$lib/")) {
-    // SvelteKit alias $lib -> src/lib
-    targetPath = resolve(projectRoot, "src/lib", importSource.slice(5));
-  } else if (importSource.startsWith("src/")) {
-    targetPath = resolve(projectRoot, importSource);
-  } else {
-    // Relative path
-    targetPath = resolve(dirname(importingFile), importSource);
-  }
+  // Parse named bindings per import statement
+  const importStatementRegex = /import\s+(?:type\s+)?([\s\S]*?)\s+from\s+['"]([^'"]+)['"]/gi;
+  while ((match = importStatementRegex.exec(scriptContent)) !== null) {
+    const bindingsChunk = match[1].replace(/^type\s+/, "").trim();
+    const moduleSpecifier = match[2];
+    if (isExternalModule(moduleSpecifier)) continue;
 
-  // Extensions to check
-  const extensions = [".ts", ".js", ".svelte", "/index.ts", "/index.js"];
-  
-  // Try resolving with ext
-  if (existsSync(targetPath) && extname(targetPath)) {
-    return targetPath;
-  }
+    const resolved = resolveImportPath(
+      importingFile,
+      moduleSpecifier,
+      projectFiles,
+      projectRoot,
+      aliases
+    );
+    if (!resolved) continue;
 
-  for (const ext of extensions) {
-    const pathWithExt = targetPath + ext;
-    if (existsSync(pathWithExt)) {
-      return pathWithExt;
+    resolvedTargets.push(resolved);
+
+    const namedBlock = bindingsChunk.match(/\{([\s\S]*?)\}/);
+    if (namedBlock) {
+      const parts = namedBlock[1].split(",");
+      for (const part of parts) {
+        const trimmed = part.trim().replace(/^type\s+/, "");
+        if (!trimmed) continue;
+        const aliasMatch = trimmed.match(/^([\w$]+)(?:\s+as\s+([\w$]+))?$/);
+        if (!aliasMatch) continue;
+        const importedName = aliasMatch[2] ?? aliasMatch[1];
+        importedSymbols.push({
+          name: importedName,
+          sourceFile: resolved,
+          fromPath: moduleSpecifier,
+        });
+      }
     }
   }
 
-  return null;
+  for (const specifier of specifiers) {
+    if (isExternalModule(specifier)) continue;
+    const resolved = resolveImportPath(
+      importingFile,
+      specifier,
+      projectFiles,
+      projectRoot,
+      aliases
+    );
+    if (resolved) {
+      resolvedTargets.push(resolved);
+    }
+  }
+
+  return {
+    resolvedTargets: [...new Set(resolvedTargets)],
+    importedSymbols,
+  };
 }
 
 /**
  * Builds the import graph and returns a list of "Dead Files" (0 imports).
- * Excludes standard SvelteKit routing pages starting with '+' and main entry points.
+ * Excludes framework entrypoints, declaration files, and shared library modules.
  */
 export function detectDeadFiles(
   projectFiles: string[],
   projectRoot: string
 ): { deadFiles: string[]; importGraph: Map<string, string[]> } {
+  const aliases = buildDefaultAliases(projectRoot);
   const importGraph = new Map<string, string[]>(); // Map of file -> list of files it imports
   const inDegree = new Map<string, number>(); // Map of file -> number of other files importing it
 
@@ -542,60 +607,42 @@ export function detectDeadFiles(
         scriptContent = parts.scripts.map((s) => s.content).join("\n\n");
       }
 
-      // Regex for static imports: import ... from "module" or import "module"
-      const staticImportRegex = /(?:import|export)\s+[\s\S]*?\s+from\s+['"]([^'"]+)['"]/gi;
-      let match;
-      const imports: string[] = [];
+      const { resolvedTargets } = extractImportsFromSource(
+        scriptContent,
+        file,
+        projectFiles,
+        projectRoot,
+        aliases
+      );
 
-      while ((match = staticImportRegex.exec(scriptContent)) !== null) {
-        imports.push(match[1]);
-      }
-
-      // Regex for dynamic imports: import("module")
-      const dynamicImportRegex = /import\s*\(\s*['"]([^'"]+)['"]\s*\)/gi;
-      while ((match = dynamicImportRegex.exec(scriptContent)) !== null) {
-        imports.push(match[1]);
-      }
-
-      const uniqueImports = Array.from(new Set(imports));
-      const resolvedPaths: string[] = [];
-
-      for (const imp of uniqueImports) {
-        const resolved = resolveImportPath(file, imp, projectFiles, projectRoot);
-        if (resolved && projectFiles.includes(resolved)) {
-          resolvedPaths.push(resolved);
+      for (const resolved of resolvedTargets) {
+        if (projectFiles.includes(resolved)) {
           inDegree.set(resolved, (inDegree.get(resolved) || 0) + 1);
         }
       }
 
-      importGraph.set(file, resolvedPaths);
-    } catch (e) {
+      importGraph.set(file, resolvedTargets.filter((p) => projectFiles.includes(p)));
+    } catch {
       // Ignore reading/parsing failures for individual files
     }
   }
 
-  // Filter out files with 0 in-degree that are entry points
   const deadFiles: string[] = [];
   for (const [file, count] of inDegree.entries()) {
-    if (count === 0) {
-      const basename = file.split("/").pop() || "";
-      
-      // SvelteKit route files starting with + (e.g., +page.svelte, +layout.svelte, etc.) are entry points
-      const isSvelteKitRoute = basename.startsWith("+");
-      
-      // Standard entrypoint paths for Workers/Vite
-      const isEntrypoint = 
-        file.endsWith("src/index.ts") || 
-        file.endsWith("src/index.js") || 
-        file.endsWith("src/app.html") || 
-        file.includes("/test/") || 
-        file.includes(".test.") || 
-        file.includes(".spec.");
+    if (count > 0) continue;
 
-      if (!isSvelteKitRoute && !isEntrypoint) {
-        deadFiles.push(file);
-      }
+    const rel = relative(projectRoot, file).replace(/\\/g, "/");
+    const isSharedLibrary = rel.includes("/lib/") || rel.startsWith("lib/");
+
+    if (
+      isProtectedFile(file) ||
+      isEntryPointFile(file, projectRoot) ||
+      isSharedLibrary
+    ) {
+      continue;
     }
+
+    deadFiles.push(file);
   }
 
   return {
@@ -607,56 +654,85 @@ export function detectDeadFiles(
 /**
  * Detects exported variables/functions/classes that are never imported anywhere.
  */
+export function collectAuxiliaryReferenceFiles(
+  projectRoot: string,
+  scanRoot: string
+): string[] {
+  const auxiliary: string[] = [];
+  const testDirs = ["test", "tests", "__tests__"];
+
+  for (const dirName of testDirs) {
+    const dir = join(projectRoot, dirName);
+    if (!existsSync(dir)) continue;
+    auxiliary.push(...scanFiles(dir, projectRoot));
+  }
+
+  const resolvedScan = resolve(scanRoot);
+  const srcRoot = resolve(projectRoot, "src");
+  if (resolvedScan === srcRoot || resolvedScan.startsWith(`${srcRoot}/`)) {
+    auxiliary.push(...scanFiles(srcRoot, projectRoot));
+  }
+
+  return [...new Set(auxiliary.map((f) => resolve(f)))];
+}
+
+/**
+ * Detects exported bindings that are not imported by any other project file.
+ * Uses resolved module paths instead of identifier substring matching.
+ */
 export function detectDeadExports(
   projectFiles: string[],
   projectRoot: string,
-  fileAnalyses: FileAnalysis[]
+  fileAnalyses: FileAnalysis[],
+  referenceFiles: string[] = []
 ): { filePath: string; deadExportName: string }[] {
   const deadExports: { filePath: string; deadExportName: string }[] = [];
-  
-  // Map of export name -> set of files that export it
-  const exportToFiles = new Map<string, string[]>();
+  const aliases = buildDefaultAliases(projectRoot);
+
+  const exportsByFile = new Map<string, Set<string>>();
   for (const analysis of fileAnalyses) {
-    for (const exp of analysis.exports) {
-      const list = exportToFiles.get(exp) || [];
-      list.push(analysis.filePath);
-      exportToFiles.set(exp, list);
+    if (isProtectedFile(analysis.filePath)) continue;
+    if (isEntryPointFile(analysis.filePath, projectRoot)) continue;
+    exportsByFile.set(analysis.filePath, new Set(analysis.exports));
+  }
+
+  const importedByFile = new Map<string, Set<string>>();
+
+  const allReferenceFiles = [...new Set([...projectFiles, ...referenceFiles])];
+
+  for (const file of allReferenceFiles) {
+    try {
+      const content = readFileSync(file, "utf-8");
+      const isSvelte = file.endsWith(".svelte");
+      let scriptContent = content;
+      if (isSvelte) {
+        scriptContent = parseSvelte(content).scripts.map((s) => s.content).join("\n\n");
+      }
+
+      const { importedSymbols } = extractImportsFromSource(
+        scriptContent,
+        file,
+        projectFiles,
+        projectRoot,
+        aliases
+      );
+
+      for (const symbol of importedSymbols) {
+        const bucket = importedByFile.get(symbol.sourceFile) || new Set<string>();
+        bucket.add(symbol.name);
+        importedByFile.set(symbol.sourceFile, bucket);
+      }
+    } catch {
+      // ignore
     }
   }
 
-  // To check if exports are imported:
-  // We scan all file contents for occurrences of the exported names
-  // excluding the files that actually export them.
-  for (const [expName, files] of exportToFiles.entries()) {
-    let isImported = false;
+  for (const [filePath, exportNames] of exportsByFile.entries()) {
+    const imported = importedByFile.get(filePath) || new Set<string>();
 
-    for (const projectFile of projectFiles) {
-      // Skip files that export this identifier
-      if (files.includes(projectFile)) continue;
-
-      try {
-        const content = readFileSync(projectFile, "utf-8");
-        // Check if the export name is imported: e.g. import { expName } from '...'
-        // A very robust heuristic: matches name inside imports or anywhere in file if it's imported
-        if (content.includes(expName)) {
-          // Verify with a word boundary to avoid false positives e.g., "myExport" matching "myExportedVar"
-          const wordRegex = new RegExp(`\\b${expName}\\b`);
-          if (wordRegex.test(content)) {
-            isImported = true;
-            break;
-          }
-        }
-      } catch (e) {
-        // ignore read error
-      }
-    }
-
-    if (!isImported) {
-      for (const file of files) {
-        deadExports.push({
-          filePath: file,
-          deadExportName: expName,
-        });
+    for (const exportName of exportNames) {
+      if (!imported.has(exportName)) {
+        deadExports.push({ filePath, deadExportName: exportName });
       }
     }
   }
