@@ -1,0 +1,13 @@
+{
+  "name": "dodeys-supercleaner",
+  "version": "1.0.0",
+  "description": "Utility to find and clean dead TypeScript, Svelte, and CSS code in Dodeys workspaces",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "clean": "bun run index.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
